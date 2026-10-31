@@ -1,0 +1,456 @@
+# =============================================================================
+# ESP Cat Feeder
+# Continuous-rotation servo feeder (SG90 360)
+# =============================================================================
+# IMPORTANT: this is a 360-degree CONTINUOUS servo, not a positional one.
+# A continuous servo has no angle - the pulse width sets SPEED and DIRECTION:
+#
+#   0.6 ms  (level -1.0) = full reverse
+#   1.5 ms  (level  0.0) = STOP            <- must be exactly this to sit still
+#   2.4 ms  (level +1.0) = full forward
+#
+# So everything is timed, like the original "2 second sweep":
+#
+#   Run Speed            forward speed in %  (lower = slower movement)
+#   Open Time per Cycle  how long it drives forward, ms  <- portion size
+#   Backoff Speed        reverse speed in %  (the "ease back" at the end)
+#   Backoff Time         how long it reverses, ms
+#   Cycles per Feed      how many forward/back pulses make one portion
+#   Neutral Trim         stop-point correction in % (0 = 1.5 ms)
+#   Max Feeds per Day    0 = unlimited
+#   Cat Detect Distance  ultrasonic trigger threshold (cm)
+#   Cooldown             minimum gap between automatic feeds (s)
+#
+# "Revolutions" = speed x time. At 100% an SG90 360 does roughly 1 turn per
+# second, so 60% for 1200 ms is about 0.7 turn per cycle.
+# =============================================================================
+
+substitutions:
+  devicename: "esp-cat-feeder"
+  upper_devicename: "ESP Cat Feeder"
+
+esphome:
+  name: $devicename
+  friendly_name: $upper_devicename
+
+  on_boot:
+    priority: -100
+    then:
+      # Neutral = stopped. Never send a driving pulse at boot, or a 360
+      # servo will spin forever.
+      - servo.write:
+          id: gate_servo
+          level: !lambda 'return id(neutral_trim).state / 100.0f;'
+      - logger.log: "Boot: servo at neutral (stopped)"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+  # Set to 0 once the feeder is mounted and you only flash over OTA.
+  baud_rate: 0
+
+wifi:
+  networks:
+    # Static IP belongs to the home network only. The second network
+    # (hotspot / backup) uses DHCP so it is not unreachable.
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+
+  ap:
+    ssid: $devicename
+    password: !secret wifi_password
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 2
+  # Native OTA only. captive_portal would otherwise also expose OTA over HTTP.
+  ota: false
+
+api:
+  encryption:
+    key: # TODO generate a new key
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    #password: # TODO add password
+
+# --- Servo -------------------------------------------------------------------
+output:
+  - platform: ledc
+    pin: GPIO13
+    id: servo_pwm
+    frequency: 50Hz
+
+servo:
+  - id: gate_servo
+    output: servo_pwm
+    min_level: 3%          # 0.6 ms = full reverse
+    max_level: 12%         # 2.4 ms = full forward
+    idle_level: 7.5%       # 1.5 ms = stop (startup position)
+    transition_length: 0ms
+    # No auto_detach_time: keep the neutral pulse applied so the servo holds
+    # still instead of coasting.
+
+# --- Time / daily counter ----------------------------------------------------
+time:
+  - platform: sntp
+    id: sntp_time
+    # Timezone for the midnight reset. ESPHome can infer this from the build
+    # machine, but setting it explicitly is safer.
+    timezone: # TODO Timezone
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - lambda: |-
+              id(feed_count) = 0;
+              id(last_feed_day) = id(sntp_time).now().day_of_year;
+          - logger.log: "Midnight: feed counter reset"
+
+globals:
+  - id: feed_count
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  # Day-of-year of the last counted feed, used to catch a missed midnight
+  # reset while the device was offline.
+  - id: last_feed_day
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  # Cycle counter for the feed loop. ESPHome's "repeat" injects an "iteration"
+  # argument into every action below it, so a repeat nested inside a repeat
+  # declares "iteration" twice and will not compile. "while" does not inject it,
+  # so the outer cycle loop counts with this global instead and the inner
+  # repeats can use their own "iteration" safely.
+  - id: cycle_i
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+# --- Tunable feeding parameters ---------------------------------------------
+number:
+  # Stop point. A continuous servo should sit dead still at 1.5 ms (level 0).
+  # If it keeps creeping, trim this in 1% steps until it stops.
+  - platform: template
+    name: "Neutral Trim"
+    id: neutral_trim
+    icon: mdi:circle-slice-8
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: -20
+    max_value: 20
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+
+  # Forward speed. Lower = slower movement.
+  - platform: template
+    name: "Run Speed"
+    id: run_speed
+    icon: mdi:speedometer
+    optimistic: true
+    restore_value: true
+    initial_value: 60
+    min_value: 10
+    max_value: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: box
+
+  # Reverse speed for the ease-back at the end of each cycle.
+  - platform: template
+    name: "Backoff Speed"
+    id: backoff_speed
+    icon: mdi:undo-variant
+    optimistic: true
+    restore_value: true
+    initial_value: 50
+    min_value: 10
+    max_value: 100
+    step: 5
+    unit_of_measurement: "%"
+    mode: box
+
+  - platform: template
+    name: "Open Time per Cycle"
+    id: open_time
+    icon: mdi:timer-sand
+    optimistic: true
+    restore_value: true
+    initial_value: 800
+    min_value: 50
+    max_value: 5000
+    step: 50
+    unit_of_measurement: ms
+    mode: box
+
+  - platform: template
+    name: "Backoff Time"
+    id: backoff_time
+    icon: mdi:timer-undo-outline
+    optimistic: true
+    restore_value: true
+    initial_value: 500
+    min_value: 0
+    max_value: 3000
+    step: 50
+    unit_of_measurement: ms
+    mode: box
+
+  - platform: template
+    name: "Cycles per Feed"
+    id: cycles_per_feed
+    icon: mdi:rotate-right
+    optimistic: true
+    restore_value: true
+    initial_value: 2
+    min_value: 1
+    max_value: 20
+    step: 1
+    mode: box
+
+  - platform: template
+    name: "Max Feeds per Day"
+    id: max_feeds
+    icon: mdi:counter
+    optimistic: true
+    restore_value: true
+    initial_value: 3
+    min_value: 0
+    max_value: 50
+    step: 1
+    mode: box
+
+  - platform: template
+    name: "Cat Detect Distance"
+    id: detect_distance
+    icon: mdi:ruler
+    optimistic: true
+    restore_value: true
+    initial_value: 12
+    min_value: 3
+    max_value: 100
+    step: 1
+    unit_of_measurement: cm
+    mode: box
+
+  - platform: template
+    name: "Cooldown"
+    id: cooldown_s
+    icon: mdi:timer-lock-outline
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    min_value: 5
+    max_value: 300
+    step: 5
+    unit_of_measurement: s
+    mode: box
+
+  # Raw calibration tool: drives the LEDC output directly in microseconds,
+  # bypassing the servo component. For a continuous servo, use it to find the
+  # pulse where the horn actually stops, then set Neutral Trim:
+  #    trim % = (stop_pulse_us - 1500) / 9
+  # (1% trim = 9 us, because 0.6-2.4 ms spans the -100..+100 level range.)
+  - platform: template
+    name: "Servo Test Pulse"
+    id: servo_pulse
+    icon: mdi:sine-wave
+    entity_category: config
+    min_value: 500
+    max_value: 2500
+    step: 10
+    unit_of_measurement: us
+    mode: slider
+    set_action:
+      - lambda: |-
+          // 50 Hz = 20 ms period, so duty fraction = pulse width / 20000 us.
+          id(servo_pwm).set_level(x / 20000.0f);
+          ESP_LOGI("feeder", "Test pulse %.0f us (%.2f%%)", x, x / 200.0f);
+      # NOTE: this moves the horn directly. Press "Test Gate" afterwards to
+      # put the servo component back in sync before feeding. A 360-degree
+      # continuous servo will just spin at a speed set by this pulse.
+
+# --- Lock --------------------------------------------------------------------
+switch:
+  - platform: template
+    name: "System Lock"
+    id: system_lock
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    icon: mdi:lock
+
+# --- Sensors -----------------------------------------------------------------
+sensor:
+  - platform: ultrasonic
+    trigger_pin: GPIO23
+    echo_pin: GPIO22
+    id: bowl_distance
+    name: "Bowl Distance"
+    icon: mdi:ruler
+    update_interval: 1s
+    timeout: 1m
+    filters:
+      - median:
+          window_size: 5
+          send_every: 2
+          send_first_at: 1
+    on_value:
+      # Tunable "cat is here" threshold, in cm, from Home Assistant / web UI.
+      - if:
+          condition:
+            lambda: 'return id(bowl_distance).state < (id(detect_distance).state / 100.0f);'
+          then:
+            - if:
+                condition:
+                  and:
+                    - switch.is_off: system_lock
+                    - not:
+                        script.is_running: cooldown
+                then:
+                  - logger.log: "Cat detected - feeding"
+                  - script.execute: dispense
+                else:
+                  - logger.log:
+                      format: "Trigger ignored (locked or cooling down)"
+                      level: DEBUG
+
+  - platform: template
+    name: "Feeds Today"
+    id: feeds_today
+    icon: mdi:cat
+    update_interval: 10s
+    accuracy_decimals: 0
+    state_class: total_increasing
+    lambda: 'return id(feed_count);'
+
+# --- Buttons -----------------------------------------------------------------
+button:
+  - platform: template
+    name: "Manual Feed"
+    icon: mdi:hand-pointing-right
+    # Bypasses the lock and the cooldown, but still respects Max Feeds per Day.
+    on_press:
+      - script.execute: dispense
+
+  - platform: template
+    name: "Test Gate"
+    icon: mdi:gate-arrow-right
+    entity_category: diagnostic
+    # One forward / ease-back / stop pulse, exactly like a real feed cycle.
+    # Does not count as a feed and does not touch the cooldown.
+    on_press:
+      - servo.write:
+          id: gate_servo
+          level: !lambda |-
+            float lvl = (id(neutral_trim).state + id(run_speed).state) / 100.0f;
+            return lvl > 1.0f ? 1.0f : lvl;
+      - delay: !lambda 'return (uint32_t) id(open_time).state;'
+      - servo.write:
+          id: gate_servo
+          level: !lambda |-
+            float lvl = (id(neutral_trim).state - id(backoff_speed).state) / 100.0f;
+            return lvl < -1.0f ? -1.0f : lvl;
+      - delay: !lambda 'return (uint32_t) id(backoff_time).state;'
+      - servo.write:
+          id: gate_servo
+          level: !lambda 'return id(neutral_trim).state / 100.0f;'
+      - logger.log: "Test cycle done"
+
+  - platform: template
+    name: "Reset Feed Counter"
+    icon: mdi:counter
+    entity_category: config
+    on_press:
+      - globals.set:
+          id: feed_count
+          value: '0'
+      - logger.log: "Feed counter manually reset"
+
+# --- Core logic --------------------------------------------------------------
+script:
+  - id: dispense
+    mode: single          # double taps / repeated triggers are ignored
+    then:
+      # Roll the counter over if midnight was missed (device was offline).
+      - lambda: |-
+          ESPTime now = id(sntp_time).now();
+          if (now.is_valid() && id(last_feed_day) != now.day_of_year) {
+            id(last_feed_day) = now.day_of_year;
+            id(feed_count) = 0;
+            ESP_LOGI("feeder", "New day detected - counter reset");
+          }
+
+      # Daily cap. 0 means unlimited.
+      - if:
+          condition:
+            lambda: |-
+              const int cap = (int) id(max_feeds).state;
+              return cap > 0 && id(feed_count) >= cap;
+          then:
+            - lambda: |-
+                ESP_LOGW("feeder", "Feed blocked: daily limit %d reached (%d today)",
+                         (int) id(max_feeds).state, id(feed_count));
+          else:
+            - script.execute: cooldown
+            - lambda: |-
+                ESP_LOGI("feeder", "Dispensing %d cycle(s): %d%% forward for %d ms, then %d%% reverse for %d ms",
+                         (int) id(cycles_per_feed).state,
+                         (int) id(run_speed).state, (int) id(open_time).state,
+                         (int) id(backoff_speed).state, (int) id(backoff_time).state);
+            - globals.set:
+                id: cycle_i
+                value: '0'
+
+            - while:
+                condition:
+                  lambda: 'return id(cycle_i) < (int) id(cycles_per_feed).state;'
+                then:
+                  # 1. Drive forward for Open Time per Cycle.
+                  - servo.write:
+                      id: gate_servo
+                      level: !lambda |-
+                        float lvl = (id(neutral_trim).state + id(run_speed).state) / 100.0f;
+                        return lvl > 1.0f ? 1.0f : lvl;
+                  - delay: !lambda 'return (uint32_t) id(open_time).state;'
+
+                  # 2. Ease back: reverse for Backoff Time.
+                  - servo.write:
+                      id: gate_servo
+                      level: !lambda |-
+                        float lvl = (id(neutral_trim).state - id(backoff_speed).state) / 100.0f;
+                        return lvl < -1.0f ? -1.0f : lvl;
+                  - delay: !lambda 'return (uint32_t) id(backoff_time).state;'
+
+                  # 3. Stop and let it settle.
+                  - servo.write:
+                      id: gate_servo
+                      level: !lambda 'return id(neutral_trim).state / 100.0f;'
+                  - delay: 300ms
+
+                  # Next cycle.
+                  - lambda: 'id(cycle_i) += 1;'
+
+            - globals.set:
+                id: feed_count
+                value: !lambda 'return id(feed_count) + 1;'
+            - lambda: |-
+                ESP_LOGI("feeder", "Feed done - %d today", id(feed_count));
+
+  # "Occupied" flag: blocks the ultrasonic from triggering while it runs.
+  - id: cooldown
+    mode: restart
+    then:
+      - delay: !lambda 'return (uint32_t)(id(cooldown_s).state * 1000.0f);'
