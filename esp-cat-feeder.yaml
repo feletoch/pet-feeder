@@ -28,6 +28,20 @@
 substitutions:
   devicename: "esp-cat-feeder"
   upper_devicename: "ESP Cat Feeder"
+  servo_pin: GPIO13
+  ultrasonic_trigger_pin: GPIO23
+  ultrasonic_en_pin: GPIO22
+
+  # --- Local settings ---------------------------------------------------------
+  # WiFi credentials stay in secrets.yaml (wifi_ssid / wifi_ssid2 /
+  # wifi_password), never in this file. Keep secrets.yaml private.
+  #
+  #   timezone   IANA name of YOUR zone, e.g. "Europe/London",
+  #              "America/New_York", "Australia/Sydney".
+  #              The feed schedule runs on local time, so a wrong value here
+  #              shifts every scheduled feed. "Etc/UTC" is a neutral default,
+  #              not a suggestion.
+  timezone: "Etc/UTC"
 
 esphome:
   name: $devicename
@@ -50,7 +64,7 @@ esp32:
 
 logger:
   level: INFO
-  # Set to 0 once the feeder is mounted and you only flash over OTA.
+  # Set to 115200 for logs
   baud_rate: 0
 
 wifi:
@@ -60,6 +74,7 @@ wifi:
     - ssid: !secret wifi_ssid
       password: !secret wifi_password
 
+  # Fallback hotspot, used only when network is reachable.
   ap:
     ssid: $devicename
     password: !secret wifi_password
@@ -73,18 +88,18 @@ web_server:
   ota: false
 
 api:
-  encryption:
-    key: # TODO generate a new key
+  # No encryption key = plaintext API. Do NOT leave an empty
+  # "encryption:" key here; it links against the encrypted frame helper
+  # and fails with an undefined APIPlaintextFrameHelper vtable.
   reboot_timeout: 0s
 
 ota:
   - platform: esphome
-    #password: # TODO add password
 
 # --- Servo -------------------------------------------------------------------
 output:
   - platform: ledc
-    pin: GPIO13
+    pin: $servo_pin
     id: servo_pwm
     frequency: 50Hz
 
@@ -104,7 +119,13 @@ time:
     id: sntp_time
     # Timezone for the midnight reset. ESPHome can infer this from the build
     # machine, but setting it explicitly is safer.
-    timezone: # TODO Timezone
+    timezone: "${timezone}"
+    # Fires on every successful sync, including the manual "Sync Time Now".
+    on_time_sync:
+      - lambda: |-
+          ESPTime t = id(sntp_time).now();
+          ESP_LOGI("feeder", "NTP time synced: %04d-%02d-%02d %02d:%02d:%02d",
+                   t.year, t.month, t.day_of_month, t.hour, t.minute, t.second);
     on_time:
       - seconds: 0
         minutes: 0
@@ -114,6 +135,19 @@ time:
               id(feed_count) = 0;
               id(last_feed_day) = id(sntp_time).now().day_of_year;
           - logger.log: "Midnight: feed counter reset"
+
+# --- Scheduled feeding start time --------------------------------------------
+# The schedule fires at this time of day, then every "Feed Every (hours)".
+datetime:
+  - platform: template
+    type: time
+    name: "First Feed At"
+    id: first_feed_at
+    entity_category: config
+    icon: mdi:clock-start
+    optimistic: true
+    restore_value: true
+    initial_value: "07:00:00"
 
 globals:
   - id: feed_count
@@ -138,6 +172,32 @@ globals:
     restore_value: no
     initial_value: '0'
 
+  # Unix timestamp (seconds) of the last *scheduled* feed. Restored across
+  # reboots so the interval keeps running. 0 = not initialised yet.
+  - id: last_auto_feed
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  # Timestamp of the schedule slot currently due (recomputed every minute).
+  - id: due_grid
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # Next scheduled slot = due_grid + one interval (recomputed every minute).
+  - id: next_grid
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # Unix timestamp of the last successful feed of ANY kind (manual / motion /
+  # scheduled). Restored across reboots. 0 = never fed.
+  - id: last_feed_ts
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
 # --- Tunable feeding parameters ---------------------------------------------
 number:
   # Stop point. A continuous servo should sit dead still at 1.5 ms (level 0).
@@ -145,6 +205,7 @@ number:
   - platform: template
     name: "Neutral Trim"
     id: neutral_trim
+    entity_category: config
     icon: mdi:circle-slice-8
     optimistic: true
     restore_value: true
@@ -159,6 +220,7 @@ number:
   - platform: template
     name: "Run Speed"
     id: run_speed
+    entity_category: config
     icon: mdi:speedometer
     optimistic: true
     restore_value: true
@@ -173,6 +235,7 @@ number:
   - platform: template
     name: "Backoff Speed"
     id: backoff_speed
+    entity_category: config
     icon: mdi:undo-variant
     optimistic: true
     restore_value: true
@@ -186,10 +249,11 @@ number:
   - platform: template
     name: "Open Time per Cycle"
     id: open_time
+    entity_category: config
     icon: mdi:timer-sand
     optimistic: true
     restore_value: true
-    initial_value: 800
+    initial_value: 1200
     min_value: 50
     max_value: 5000
     step: 50
@@ -199,10 +263,11 @@ number:
   - platform: template
     name: "Backoff Time"
     id: backoff_time
+    entity_category: config
     icon: mdi:timer-undo-outline
     optimistic: true
     restore_value: true
-    initial_value: 500
+    initial_value: 400
     min_value: 0
     max_value: 3000
     step: 50
@@ -212,6 +277,7 @@ number:
   - platform: template
     name: "Cycles per Feed"
     id: cycles_per_feed
+    entity_category: config
     icon: mdi:rotate-right
     optimistic: true
     restore_value: true
@@ -224,6 +290,7 @@ number:
   - platform: template
     name: "Max Feeds per Day"
     id: max_feeds
+    entity_category: config
     icon: mdi:counter
     optimistic: true
     restore_value: true
@@ -236,10 +303,11 @@ number:
   - platform: template
     name: "Cat Detect Distance"
     id: detect_distance
+    entity_category: config
     icon: mdi:ruler
     optimistic: true
     restore_value: true
-    initial_value: 12
+    initial_value: 10
     min_value: 3
     max_value: 100
     step: 1
@@ -249,14 +317,31 @@ number:
   - platform: template
     name: "Cooldown"
     id: cooldown_s
+    entity_category: config
     icon: mdi:timer-lock-outline
     optimistic: true
     restore_value: true
-    initial_value: 30
-    min_value: 30
-    max_value: 7200
+    initial_value: 360
+    min_value: 5
+    max_value: 3600
     step: 5
     unit_of_measurement: s
+    mode: box
+
+  # How often the scheduled feeder runs. Only used when "Scheduled Feeding"
+  # is on; the daily cap still applies.
+  - platform: template
+    name: "Feed Every (hours)"
+    id: feed_interval_h
+    entity_category: config
+    icon: mdi:calendar-clock
+    optimistic: true
+    restore_value: true
+    initial_value: 6
+    min_value: 1
+    max_value: 24
+    step: 1
+    unit_of_measurement: h
     mode: box
 
   # Raw calibration tool: drives the LEDC output directly in microseconds,
@@ -268,7 +353,7 @@ number:
     name: "Servo Test Pulse"
     id: servo_pulse
     icon: mdi:sine-wave
-    entity_category: config
+    entity_category: diagnostic
     min_value: 500
     max_value: 2500
     step: 10
@@ -292,13 +377,30 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     icon: mdi:lock
 
+  # Ultrasonic-triggered feeding on/off.
+  - platform: template
+    name: "Motion Trigger Feeding"
+    id: detect_feed_enabled
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    icon: mdi:motion-sensor
+
+  # Timed feeding on/off.
+  - platform: template
+    name: "Scheduled Feeding"
+    id: schedule_feed_enabled
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    icon: mdi:calendar-clock
+
 # --- Sensors -----------------------------------------------------------------
 sensor:
   - platform: ultrasonic
-    trigger_pin: GPIO23
-    echo_pin: GPIO22
+    trigger_pin: $ultrasonic_trigger_pin
+    echo_pin: $ultrasonic_en_pin
     id: bowl_distance
     name: "Bowl Distance"
+    entity_category: diagnostic
     icon: mdi:ruler
     update_interval: 1s
     timeout: 1m
@@ -316,6 +418,7 @@ sensor:
             - if:
                 condition:
                   and:
+                    - switch.is_on: detect_feed_enabled
                     - switch.is_off: system_lock
                     - not:
                         script.is_running: cooldown
@@ -324,7 +427,7 @@ sensor:
                   - script.execute: dispense
                 else:
                   - logger.log:
-                      format: "Trigger ignored (locked or cooling down)"
+                      format: "Trigger ignored (detect off / locked / cooling down)"
                       level: DEBUG
 
   - platform: template
@@ -336,6 +439,70 @@ sensor:
     state_class: total_increasing
     lambda: 'return id(feed_count);'
 
+# --- Time / schedule display -------------------------------------------------
+# Read-only views of the clock and the feed schedule. Plain text sensors so
+# Home Assistant shows readable strings instead of epoch numbers.
+text_sensor:
+  # Proves the on-board clock is right. Shows "waiting for NTP" until the
+  # first successful sync.
+  - platform: template
+    name: "Current Time"
+    id: current_time
+    entity_category: diagnostic
+    icon: mdi:clock-outline
+    update_interval: 10s
+    lambda: |-
+      ESPTime t = id(sntp_time).now();
+      if (!t.is_valid()) {
+        return std::string("waiting for NTP");
+      }
+      return t.strftime("%Y-%m-%d %H:%M:%S");
+
+  # When the last feed of any kind happened. Polled, so the wording rolls over
+  # from "Today" to "Yesterday" on its own at midnight.
+  - platform: template
+    name: "Last Feed"
+    id: last_feed
+    icon: mdi:history
+    update_interval: 60s
+    lambda: |-
+      if (id(last_feed_ts) == 0) {
+        return std::string("Never");
+      }
+      ESPTime feed = ESPTime::from_epoch_local((time_t) id(last_feed_ts));
+      ESPTime now = id(sntp_time).now();
+      if (now.is_valid()) {
+        if (feed.day_of_year == now.day_of_year && feed.year == now.year) {
+          return std::string("Today ") + feed.strftime("%H:%M");
+        }
+        ESPTime yesterday = ESPTime::from_epoch_local((time_t) (now.timestamp - 86400));
+        if (feed.day_of_year == yesterday.day_of_year && feed.year == yesterday.year) {
+          return std::string("Yesterday ") + feed.strftime("%H:%M");
+        }
+      }
+      return feed.strftime("%d %b %H:%M");
+
+  # Next slot on the schedule, mirroring what the scheduler will actually do:
+  # a disabled schedule reads "Off" and a locked feeder appends "(locked)".
+  - platform: template
+    name: "Next Feed"
+    id: next_feed
+    icon: mdi:calendar-arrow-right
+    update_interval: 60s
+    lambda: |-
+      if (!id(schedule_feed_enabled).state) {
+        return std::string("Off");
+      }
+      if (id(next_grid) == 0) {
+        return std::string("waiting for NTP");
+      }
+      ESPTime next = ESPTime::from_epoch_local((time_t) id(next_grid));
+      std::string out = next.strftime("%a %H:%M");
+      if (id(system_lock).state) {
+        out += " (locked)";
+      }
+      return out;
+
 # --- Buttons -----------------------------------------------------------------
 button:
   - platform: template
@@ -344,6 +511,16 @@ button:
     # Bypasses the lock and the cooldown, but still respects Max Feeds per Day.
     on_press:
       - script.execute: dispense
+
+  - platform: template
+    name: "Sync Time Now"
+    icon: mdi:clock-check
+    # There is no native SNTP resync action, and SNTPComponent::update() is
+    # compiled out on ESP32. Re-running setup() stops and re-inits SNTP, which
+    # polls the servers immediately instead of waiting for the hourly refresh.
+    on_press:
+      - logger.log: "Manual time sync requested"
+      - lambda: 'id(sntp_time).setup();'
 
   - platform: template
     name: "Test Gate"
@@ -372,12 +549,73 @@ button:
   - platform: template
     name: "Reset Feed Counter"
     icon: mdi:counter
-    entity_category: config
+    entity_category: diagnostic
     on_press:
       - globals.set:
           id: feed_count
           value: '0'
       - logger.log: "Feed counter manually reset"
+
+# --- Scheduled feeding -------------------------------------------------------
+# Fires at "First Feed At", then every "Feed Every (hours)" after that, e.g.
+#   07:00 -> 13:00 -> 19:00 -> 01:00
+# It works out which clock slot is currently due, so the times stay fixed
+# instead of drifting with every reboot.
+interval:
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              ESPTime now = id(sntp_time).now();
+              if (!now.is_valid()) {
+                return false;
+              }
+              const int32_t interval_s = (int32_t) (id(feed_interval_h).state * 3600.0f);
+              if (interval_s <= 0) {
+                return false;
+              }
+              const int32_t now_s = now.hour * 3600 + now.minute * 60 + now.second;
+              const int32_t midnight = (int32_t) now.timestamp - now_s;
+              const int32_t start_s = id(first_feed_at).hour * 3600 +
+                                      id(first_feed_at).minute * 60 +
+                                      id(first_feed_at).second;
+              // Most recent slot at or before now, which may be yesterday.
+              // C division truncates toward zero, so negative "since" needs an
+              // extra step down to get a floor: without it, a time before
+              // "First Feed At" resolves to a slot in the FUTURE.
+              const int32_t since = now_s - start_s;
+              int32_t k = since / interval_s;
+              if (since < 0 && since % interval_s != 0) {
+                k -= 1;
+              }
+              id(due_grid) = midnight + start_s + k * interval_s;
+              // Slot after the one currently due, for the "Next Feed" readout.
+              id(next_grid) = id(due_grid) + interval_s;
+              // First valid time after boot: seed the slot, do not feed.
+              if (id(last_auto_feed) == 0) {
+                id(last_auto_feed) = id(due_grid);
+                return false;
+              }
+              return id(due_grid) > id(last_auto_feed);
+          then:
+            - if:
+                condition:
+                  and:
+                    - switch.is_on: schedule_feed_enabled
+                    - switch.is_off: system_lock
+                    - not:
+                        script.is_running: cooldown
+                then:
+                  - globals.set:
+                      id: last_auto_feed
+                      value: !lambda 'return id(due_grid);'
+                  - logger.log: "Scheduled feed"
+                  - script.execute: dispense
+                else:
+                  - logger.log:
+                      format: "Scheduled feed due, skipped (disabled / locked / cooling down)"
+                      level: DEBUG
 
 # --- Core logic --------------------------------------------------------------
 script:
@@ -447,6 +685,10 @@ script:
                 id: feed_count
                 value: !lambda 'return id(feed_count) + 1;'
             - lambda: |-
+                ESPTime t = id(sntp_time).now();
+                if (t.is_valid()) {
+                  id(last_feed_ts) = (int32_t) t.timestamp;
+                }
                 ESP_LOGI("feeder", "Feed done - %d today", id(feed_count));
 
   # "Occupied" flag: blocks the ultrasonic from triggering while it runs.
