@@ -33,7 +33,7 @@ substitutions:
   ultrasonic_en_pin: GPIO22
 
   # --- Local settings ---------------------------------------------------------
-  # WiFi credentials stay in secrets.yaml (wifi_ssid / wifi_ssid2 /
+  # WiFi credentials stay in secrets.yaml (wifi_ssid / 
   # wifi_password), never in this file. Keep secrets.yaml private.
   #
   #   timezone   IANA name of YOUR zone, e.g. "Europe/London",
@@ -69,7 +69,7 @@ logger:
 
 wifi:
   networks:
-    # Static IP belongs to the home network only. The second network
+    # Static IP belongs to the home network only.
     # (hotspot / backup) uses DHCP so it is not unreachable.
     - ssid: !secret wifi_ssid
       password: !secret wifi_password
@@ -557,8 +557,10 @@ button:
       - logger.log: "Feed counter manually reset"
 
 # --- Scheduled feeding -------------------------------------------------------
-# Fires at "First Feed At", then every "Feed Every (hours)" after that, e.g.
-#   07:00 -> 13:00 -> 19:00 -> 01:00
+# Fires at "First Feed At", then every "Feed Every (hours)" after that, and
+# restarts from "First Feed At" every midnight. A slot that would land at or
+# after midnight is dropped, e.g. with 07:00 and 6 h:
+#   07:00 -> 13:00 -> 19:00 -> (midnight) -> 07:00 -> ...
 # It works out which clock slot is currently due, so the times stay fixed
 # instead of drifting with every reboot.
 interval:
@@ -580,23 +582,42 @@ interval:
               const int32_t start_s = id(first_feed_at).hour * 3600 +
                                       id(first_feed_at).minute * 60 +
                                       id(first_feed_at).second;
-              // Most recent slot at or before now, which may be yesterday.
-              // C division truncates toward zero, so negative "since" needs an
-              // extra step down to get a floor: without it, a time before
-              // "First Feed At" resolves to a slot in the FUTURE.
-              const int32_t since = now_s - start_s;
-              int32_t k = since / interval_s;
-              if (since < 0 && since % interval_s != 0) {
-                k -= 1;
+              // Slots exist only inside a single day: First Feed At, +N hours,
+              // ... and the day restarts at midnight. A slot that would land
+              // at or after midnight is dropped, so the first feed of every
+              // day is always "First Feed At".
+              const int32_t last_k = (86399 - start_s) / interval_s;
+
+              int32_t due_off;    // seconds after today's local midnight
+              int32_t next_off;
+              if (now_s >= start_s) {
+                const int32_t k = (now_s - start_s) / interval_s;
+                due_off = start_s + k * interval_s;
+                // After the day's final slot, next is tomorrow's first slot.
+                next_off = (k < last_k) ? (due_off + interval_s) : (86400 + start_s);
+              } else {
+                // Before today's first slot: the last slot was yesterday's.
+                due_off = -86400 + start_s + last_k * interval_s;
+                next_off = start_s;
               }
-              id(due_grid) = midnight + start_s + k * interval_s;
-              // Slot after the one currently due, for the "Next Feed" readout.
-              id(next_grid) = id(due_grid) + interval_s;
+              id(due_grid) = midnight + due_off;
+              id(next_grid) = midnight + next_off;
+
               // First valid time after boot: seed the slot, do not feed.
               if (id(last_auto_feed) == 0) {
                 id(last_auto_feed) = id(due_grid);
                 return false;
               }
+
+              // Midnight closes the day. Between 00:00 and "First Feed At" the
+              // schedule is idle, so a slot left unserved yesterday is dropped
+              // instead of firing just after midnight.
+              if (now_s < start_s && id(last_auto_feed) < id(due_grid)) {
+                id(last_auto_feed) = id(due_grid);
+                ESP_LOGD("feeder", "Midnight reset: dropped unserved slot from yesterday");
+                return false;
+              }
+
               return id(due_grid) > id(last_auto_feed);
           then:
             - if:
